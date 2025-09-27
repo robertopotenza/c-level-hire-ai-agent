@@ -1,0 +1,17 @@
+﻿{
+  "anthropic_api_key": "$ANTHROPIC_API_KEY",
+  "github_webhook_secret": "$GITHUB_WEBHOOK_SECRET",
+  "repositories": {
+    "c_level_hire": {
+      "url": "https://github.com/robertopotenza/C_level_hire.git",
+      "local_path": "./repos/c_level_hire",
+      "branch": "main",
+      "description": "C-level hiring repository - Production on Railway"
+    }
+  },
+  "watched_extensions": [".py", ".js", ".ts", ".jsx", ".tsx", ".md", ".json", ".yml", ".yaml", ".html", ".css", ".sql"],
+  "ignored_paths": [".git", "node_modules", "__pycache__", ".env", "venv", "dist", "build", ".DS_Store"],
+  "max_file_size": 150000,
+  "server_port": 8080,
+  "default_repo": "c_level_hire"
+}
