@@ -1,12 +1,12 @@
 ﻿import os
 import json
 import logging
-from flask import Flask, request, jsonify
-from anthropic import Anthropic
-import git
+import requests
+import base64
 import hashlib
 import hmac
-from pathlib import Path
+from flask import Flask, request, jsonify
+from anthropic import Anthropic
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -18,8 +18,6 @@ class RailwayAgent:
         self.anthropic = Anthropic(api_key=self.config["anthropic_api_key"])
         self.app = Flask(__name__)
         self.setup_routes()
-        self.repos_dir = Path("./repos")
-        self.repos_dir.mkdir(exist_ok=True)
         
     def load_config(self, config_file):
         """Load configuration with environment variable substitution"""
@@ -46,6 +44,7 @@ class RailwayAgent:
             return jsonify({
                 "message": "C-Level Hire AI Agent",
                 "status": "running",
+                "method": "github_api",
                 "available_endpoints": ["/analyze", "/webhook", "/status"]
             })
         
@@ -53,7 +52,8 @@ class RailwayAgent:
         def status():
             return jsonify({
                 "repositories": list(self.config["repositories"].keys()),
-                "last_sync": "Available on request"
+                "method": "github_api",
+                "status": "ready"
             })
         
         @self.app.route('/analyze', methods=['POST'])
@@ -63,11 +63,14 @@ class RailwayAgent:
                 query = data.get('query', 'Analyze this repository')
                 repo_name = data.get('repository', self.config["default_repo"])
                 
-                # Ensure repository is synced
-                self.sync_repository(repo_name)
+                # Fetch repo contents via GitHub API
+                file_contents = self.fetch_repo_via_github_api(repo_name)
                 
-                # Read file contents
-                file_contents = self.read_file_contents(repo_name)
+                if not file_contents:
+                    return jsonify({
+                        'success': False,
+                        'error': 'No readable files found in repository'
+                    }), 400
                 
                 # Send to Claude
                 response = self.send_to_claude(query, file_contents, repo_name)
@@ -75,7 +78,8 @@ class RailwayAgent:
                 return jsonify({
                     'success': True,
                     'analysis': response,
-                    'repository': repo_name
+                    'repository': repo_name,
+                    'files_analyzed': len(file_contents)
                 })
                 
             except Exception as e:
@@ -106,9 +110,6 @@ class RailwayAgent:
                 if not repo_name:
                     return jsonify({'message': 'Repository not watched'}), 200
                 
-                # Sync the repository
-                self.sync_repository(repo_name)
-                
                 # Auto-analyze on push
                 if payload.get('ref') == f'refs/heads/{self.config["repositories"][repo_name]["branch"]}':
                     commits = payload.get('commits', [])
@@ -118,9 +119,8 @@ class RailwayAgent:
                         
                         if modified_files:
                             query = f"Review the recent changes: {', '.join(modified_files[:5])}"
-                            file_contents = self.read_file_contents(repo_name)
+                            file_contents = self.fetch_repo_via_github_api(repo_name)
                             analysis = self.send_to_claude(query, file_contents, repo_name)
-                            
                             logger.info(f"Auto-analysis completed for {repo_name}")
                 
                 return jsonify({'message': 'Webhook processed successfully'}), 200
@@ -138,60 +138,74 @@ class RailwayAgent:
         expected_signature = hmac.new(secret, payload_body, hashlib.sha256).hexdigest()
         return hmac.compare_digest(f"sha256={expected_signature}", signature_header)
     
-    def sync_repository(self, repo_name):
-        """Clone or pull the latest version of a repository"""
-        if repo_name not in self.config["repositories"]:
-            raise ValueError(f"Unknown repository: {repo_name}")
+    def fetch_repo_via_github_api(self, repo_name):
+        """Fetch repository contents via GitHub API"""
+        logger.info(f"Fetching repository {repo_name} via GitHub API")
         
+        # Extract owner/repo from URL
         repo_config = self.config["repositories"][repo_name]
-        local_path = Path(repo_config["local_path"])
+        repo_url = repo_config["url"]
         
-        try:
-            if local_path.exists():
-                # Pull latest changes
-                repo = git.Repo(local_path)
-                origin = repo.remotes.origin
-                origin.pull()
-                logger.info(f"Updated repository {repo_name}")
-            else:
-                # Clone repository
-                local_path.parent.mkdir(parents=True, exist_ok=True)
-                git.Repo.clone_from(repo_config["url"], local_path)
-                logger.info(f"Cloned repository {repo_name}")
-                
-        except Exception as e:
-            logger.error(f"Error syncing repository {repo_name}: {str(e)}")
-            raise
-    
-    def read_file_contents(self, repo_name):
-        """Read and return file contents from repository"""
-        repo_config = self.config["repositories"][repo_name]
-        local_path = Path(repo_config["local_path"])
+        # Parse GitHub URL to get owner/repo
+        if "github.com/" in repo_url:
+            parts = repo_url.split("github.com/")[1].replace(".git", "").split("/")
+            owner, repo = parts[0], parts[1]
+        else:
+            raise ValueError(f"Invalid GitHub URL: {repo_url}")
         
-        if not local_path.exists():
-            raise ValueError(f"Repository {repo_name} not found locally")
+        # Fetch repository tree
+        api_url = f"https://api.github.com/repos/{owner}/{repo}/git/trees/main?recursive=1"
+        logger.info(f"Fetching from: {api_url}")
         
+        response = requests.get(api_url)
+        
+        if response.status_code != 200:
+            raise Exception(f"Failed to fetch repository tree: {response.status_code} - {response.text}")
+        
+        tree_data = response.json()
         file_contents = {}
+        
         watched_extensions = self.config["watched_extensions"]
         ignored_paths = self.config["ignored_paths"]
         max_file_size = self.config["max_file_size"]
         
-        def should_ignore(path):
-            path_str = str(path)
-            return any(ignored in path_str for ignored in ignored_paths)
+        files_processed = 0
         
-        for file_path in local_path.rglob("*"):
-            if file_path.is_file() and not should_ignore(file_path):
-                if file_path.suffix in watched_extensions:
-                    try:
-                        if file_path.stat().st_size <= max_file_size:
-                            relative_path = file_path.relative_to(local_path)
-                            with open(file_path, 'r', encoding='utf-8') as f:
-                                file_contents[str(relative_path)] = f.read()
-                    except (UnicodeDecodeError, PermissionError):
-                        # Skip binary files or files we can't read
-                        continue
+        for item in tree_data.get("tree", []):
+            if item["type"] == "blob":  # It's a file
+                file_path = item["path"]
+                
+                # Check if we should process this file
+                if any(ignored in file_path for ignored in ignored_paths):
+                    continue
+                
+                file_ext = "." + file_path.split(".")[-1] if "." in file_path else ""
+                if file_ext not in watched_extensions:
+                    continue
+                
+                if item["size"] > max_file_size:
+                    logger.info(f"Skipping large file: {file_path} ({item['size']} bytes)")
+                    continue
+                
+                # Fetch file content
+                file_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{file_path}"
+                file_response = requests.get(file_url)
+                
+                if file_response.status_code == 200:
+                    file_data = file_response.json()
+                    if file_data.get("encoding") == "base64":
+                        try:
+                            content = base64.b64decode(file_data["content"]).decode('utf-8')
+                            file_contents[file_path] = content
+                            files_processed += 1
+                            logger.info(f"Processed file: {file_path}")
+                        except (UnicodeDecodeError, Exception) as e:
+                            logger.warning(f"Skipping binary/unreadable file: {file_path} - {e}")
+                            continue
+                else:
+                    logger.warning(f"Failed to fetch file {file_path}: {file_response.status_code}")
         
+        logger.info(f"Successfully processed {files_processed} files from {repo_name}")
         return file_contents
     
     def send_to_claude(self, query, file_contents, repo_name):
@@ -200,6 +214,7 @@ class RailwayAgent:
         
         # Prepare context
         context = f"Repository: {repo_name}\nDescription: {repo_description}\n\n"
+        context += f"Files analyzed: {len(file_contents)}\n\n"
         context += "File Contents:\n"
         
         for file_path, content in file_contents.items():
